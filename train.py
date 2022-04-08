@@ -1,138 +1,103 @@
+# -*- coding: utf-8 -*-
+# @Author: Yedarm Seong
+# @Date:   2022-04-05 16:20:48
+# @Last Modified by:   Yedarm Seong
+# @Last Modified time: 2022-04-08 02:32:28
+
+
+import torch
 from torch import optim
 from torch import nn
 from torch.autograd import Variable
-from tqdm import tqdm
-from visdom import Visdom
 import utils
 import visual
 
 
-def train(model, train_datasets, test_datasets, epochs_per_task=10,
-          batch_size=64, test_size=1024, consolidate=True,
-          fisher_estimation_sample_size=1024,
-          lr=1e-3, weight_decay=1e-5,
-          loss_log_interval=30,
-          eval_log_interval=50,
-          cuda=False):
+def train(
+    model,
+    dic_tr_dl,  # dict of dataloader
+    dic_val_dl,  # dict of dataloader
+    unbiased_te_dl,  # dataloader
+    wandb_writer,
+    epochs_per_task=20,
+    batch_size=32,
+    consolidate=True,
+    fisher_estimation_sample_size=512,
+    lr=1e-3,
+    weight_decay=1e-5,
+    cuda=False,
+):
     # prepare the loss criteriton and the optimizer.
     criteriton = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=lr,
-                          weight_decay=weight_decay)
-
-    # instantiate a visdom client
-    vis = Visdom(env=model.name)
+    optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # set the model's mode to training mode.
     model.train()
 
-    for task, train_dataset in enumerate(train_datasets, 1):
-        for epoch in range(1, epochs_per_task+1):
-            # prepare the data loaders.
-            data_loader = utils.get_data_loader(
-                train_dataset, batch_size=batch_size,
-                cuda=cuda
-            )
-            data_stream = tqdm(enumerate(data_loader, 1))
+    for i in range(1, 11):  # task number
+        print(f"{i}th task")
+        logs = dict()
+        for epoch in range(1, epochs_per_task + 1):
+            # train[i]에 대해 train
+            train_loader = dic_tr_dl[i]
 
-            for batch_index, (x, y) in data_stream:
-                # where are we?
-                data_size = len(x)
-                dataset_size = len(data_loader.dataset)
-                dataset_batches = len(data_loader)
-                previous_task_iteration = sum([
-                    epochs_per_task * len(d) // batch_size for d in
-                    train_datasets[:task-1]
-                ])
-                current_task_iteration = (
-                    (epoch-1)*dataset_batches + batch_index
-                )
-                iteration = (
-                    previous_task_iteration +
-                    current_task_iteration
-                )
-
-                # prepare the data.
-                x = x.view(data_size, -1)
-                x = Variable(x).cuda() if cuda else Variable(x)
-                y = Variable(y).cuda() if cuda else Variable(y)
+            loss_sum = 0.0
+            total_num_train = 0
+            for images, labels in train_loader:
+                images = Variable(images.cuda()) if cuda else Variable(images)
+                labels = Variable(labels.cuda()) if cuda else Variable(labels)
+                bsize = images.shape[0]
+                total_num_train += bsize
 
                 # run the model and backpropagate the errors.
                 optimizer.zero_grad()
-                scores = model(x)
-                ce_loss = criteriton(scores, y)
+                scores = model(images)
+                ce_loss = criteriton(scores, labels)
                 ewc_loss = model.ewc_loss(cuda=cuda)
                 loss = ce_loss + ewc_loss
+                loss_sum += bsize * loss.item()
                 loss.backward()
                 optimizer.step()
 
-                # calculate the training precision.
-                _, predicted = scores.max(1)
-                precision = (predicted == y).sum().float() / len(x)
+            avg_loss = loss_sum / total_num_train
+            print(f"{epoch}/{epochs_per_task}, train loss: {avg_loss}")
 
-                data_stream.set_description((
-                    '=> '
-                    'task: {task}/{tasks} | '
-                    'epoch: {epoch}/{epochs} | '
-                    'progress: [{trained}/{total}] ({progress:.0f}%) | '
-                    'prec: {prec:.4} | '
-                    'loss => '
-                    'ce: {ce_loss:.4} / '
-                    'ewc: {ewc_loss:.4} / '
-                    'total: {loss:.4}'
-                ).format(
-                    task=task,
-                    tasks=len(train_datasets),
-                    epoch=epoch,
-                    epochs=epochs_per_task,
-                    trained=batch_index*batch_size,
-                    total=dataset_size,
-                    progress=(100.*batch_index/dataset_batches),
-                    prec=float(precision),
-                    ce_loss=float(ce_loss),
-                    ewc_loss=float(ewc_loss),
-                    loss=float(loss),
-                ))
-
-                # Send test precision to the visdom server.
-                if iteration % eval_log_interval == 0:
-                    names = [
-                        'task {}'.format(i+1) for i in
-                        range(len(train_datasets))
-                    ]
-                    precs = [
-                        utils.validate(
-                            model, test_datasets[i], test_size=test_size,
-                            cuda=cuda, verbose=False,
-                        ) if i+1 <= task else 0 for i in
-                        range(len(train_datasets))
-                    ]
-                    title = (
-                        'precision (consolidated)' if consolidate else
-                        'precision'
-                    )
-                    visual.visualize_scalars(
-                        vis, precs, names, title,
-                        iteration
-                    )
-
-                # Send losses to the visdom server.
-                if iteration % loss_log_interval == 0:
-                    title = 'loss (consolidated)' if consolidate else 'loss'
-                    visual.visualize_scalars(
-                        vis,
-                        [loss, ce_loss, ewc_loss],
-                        ['total', 'cross entropy', 'ewc'],
-                        title, iteration
-                    )
-
-        if consolidate and task < len(train_datasets):
+        if consolidate:
             # estimate the fisher information of the parameters and consolidate
             # them in the network.
             print(
-                '=> Estimating diagonals of the fisher information matrix...',
-                flush=True, end='',
+                "=> Estimating diagonals of the fisher information matrix...",
+                flush=True,
+                end="",
             )
-            model.consolidate(model.estimate_fisher(
-                train_dataset, fisher_estimation_sample_size
-            ))
-            print(' Done!')
+            model.consolidate(
+                model.estimate_fisher(train_dataset, fisher_estimation_sample_size)
+            )
+            print(" Done!")
+
+        # unbiased에 대해 validation
+        accuracy_unbiased = utils.validate(
+            model, optimizer, criteriton, unbiased_te_dl, cuda=cuda
+        )
+        print(f"accuracy of unbiased {accuracy_unbiased}")
+        logs["test/acc"] = accuracy_unbiased
+
+        accuracy_task_1 = utils.validate(
+            model, optimizer, criteriton, dic_val_dl[1], cuda=cuda
+        )
+        print(f"accuracy of task 1 {accuracy_task_1}")
+        logs["valid/task1_acc_after"] = accuracy_task_1
+
+        if i > 1:
+            accuracy_prev_task = utils.validate(
+                model, optimizer, criteriton, dic_val_dl[i - 1], cuda=cuda
+            )
+            print(f"accuracy of prev task {accuracy_prev_task}")
+            logs["valid/task_pre_acc_after"] = accuracy_prev_task
+        # val[i]에 대해 validation
+        accuracy_current_task = utils.validate(
+            model, optimizer, criteriton, dic_val_dl[i], cuda=cuda
+        )
+        print(f"accuracy of current task {accuracy_current_task}")
+        logs["valid/task_acc"] = accuracy_current_task
+        wandb_writer.log(logs)
